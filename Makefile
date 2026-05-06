@@ -18,5 +18,5 @@ monitor:
 	$(PIO) device monitor
 
 # webサーバ起動
-server:
+serve:
 	npx serve web
