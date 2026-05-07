@@ -40,7 +40,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.println(message);
 
   // 受信したメッセージに応じて画面の色を変える
-  if (message == "red") {
+  if (message.startsWith("0x")) {
+    // 文字列を16進数の数値に変換 (例: "0xFF00" -> 0xFF00)
+    uint16_t color = (uint16_t)strtol(message.c_str(), NULL, 0);
+
+    M5.Lcd.fillScreen(color);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.printf("Color: %s", message.c_str());
+  }
+  else if (message == "red") {
     M5.Lcd.fillScreen(RED);
     M5.Lcd.setCursor(10, 10);
     M5.Lcd.println("Color: RED");
