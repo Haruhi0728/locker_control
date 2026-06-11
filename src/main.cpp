@@ -39,7 +39,11 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("] ");
   Serial.println(message);
 
+<<<<<<< HEAD
    // 受信したメッセージに応じて画面の色を変える
+=======
+  // 受信したメッセージに応じて画面の色を変える
+>>>>>>> 1aee6c51c8400321b293577bfdaaf52784b5f877
   if (message.startsWith("0x")) {
     // 文字列を16進数の数値に変換 (例: "0xFF00" -> 0xFF00)
     uint16_t color = (uint16_t)strtol(message.c_str(), NULL, 0);

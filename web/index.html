@@ -27,7 +27,9 @@
         <h2 class="text-sm font-bold text-gray-500 uppercase mb-3">設定</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
           <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1">送信トピック (Web -> M5)</label>
+            <label class="block text-xs font-semibold text-gray-600 mb-1"
+              >送信トピック (Web -> M5)</label
+            >
             <input
               type="text"
               id="topic-publish-input"
@@ -35,7 +37,9 @@
             />
           </div>
           <div>
-            <label class="block text-xs font-semibold text-gray-600 mb-1">受信トピック (M5 -> Web)</label>
+            <label class="block text-xs font-semibold text-gray-600 mb-1"
+              >受信トピック (M5 -> Web)</label
+            >
             <input
               type="text"
               id="topic-subscribe-input"
@@ -184,14 +188,15 @@
       function subscribeToTopic(topic) {
         client.subscribe(topic, (err) => {
           if (!err) {
-            addLog("システム", `トピック '${topic}' の受信待機を開始しました。`);
+            addLog(
+              "システム",
+              `トピック '${topic}' の受信待機を開始しました。`,
+            );
           } else {
             addLog("エラー", `Subscribe ('${topic}') に失敗しました。`);
           }
         });
       }
-
-      // 接続が切れた時の処理
 
       // 接続が切れた時の処理
       client.on("offline", () => {
