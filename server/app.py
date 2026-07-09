@@ -1,61 +1,62 @@
 from flask import Flask, render_template, request, jsonify
-import sqlite3
 import datetime
 import json
 import threading
 import atexit
+import os
+from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
+
+
+# ===== .env 読み込み =====
+load_dotenv()
+
 
 app = Flask(__name__)
 
-# ===== MQTT設定 =====
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 8884
-MQTT_TOPIC = "m5stack/device_02/servo"
 
-# MQTTクライアントを常時接続で使う
+# ===== Supabase / アプリURL設定 =====
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+APP_URL = os.getenv("APP_URL", "http://localhost:5000")
+
+
+# ===== MQTT設定 =====
+MQTT_BROKER = os.getenv("MQTT_BROKER", "broker.hivemq.com")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "8884"))
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "m5stack/device_02/servo")
+
 MQTT_CLIENT = None
 MQTT_LOCK = threading.Lock()
 
-# ===== DB設定 =====
-DB_NAME = "logs.db"
+
+# ===== JSONログ設定 =====
+JSON_LOG_FILE = os.getenv("JSON_LOG_FILE", "access_logs.json")
+JSON_LOG_LOCK = threading.Lock()
 
 
-# ===== DB初期化 =====
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS access_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            user_email TEXT,
-            user_name TEXT,
-            action TEXT NOT NULL,
-            angle INTEGER,
-            duration INTEGER,
-            mqtt_topic TEXT,
-            result TEXT,
-            ip_address TEXT
-        )
-    """)
-
-    # 既存DBに user_name カラムがない場合の自動追加
-    cur.execute("PRAGMA table_info(access_logs)")
-    columns = [row[1] for row in cur.fetchall()]
-
-    if "user_name" not in columns:
-        cur.execute("""
-            ALTER TABLE access_logs
-            ADD COLUMN user_name TEXT
-        """)
-
-    conn.commit()
-    conn.close()
+# ===== JSONログ初期化 =====
+def init_json_log():
+    if not os.path.exists(JSON_LOG_FILE):
+        with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
 
 
-# ===== ログ保存 =====
+# ===== JSONログ読み込み =====
+def load_json_logs():
+    init_json_log()
+
+    with JSON_LOG_LOCK:
+        with open(JSON_LOG_FILE, "r", encoding="utf-8") as f:
+            try:
+                logs = json.load(f)
+            except json.JSONDecodeError:
+                logs = []
+
+    return logs
+
+
+# ===== JSONログ保存 =====
 def save_log(
     user_email,
     user_name,
@@ -65,40 +66,47 @@ def save_log(
     result,
     ip_address
 ):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
+    init_json_log()
 
-    # 日本時間で保存
     jst = datetime.timezone(datetime.timedelta(hours=9))
     timestamp = datetime.datetime.now(jst).isoformat(timespec="seconds")
 
-    cur.execute("""
-        INSERT INTO access_logs (
-            timestamp,
-            user_email,
-            user_name,
-            action,
-            angle,
-            duration,
-            mqtt_topic,
-            result,
-            ip_address
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        timestamp,
-        user_email,
-        user_name,
-        action,
-        angle,
-        duration,
-        MQTT_TOPIC,
-        result,
-        ip_address
-    ))
+    with JSON_LOG_LOCK:
+        with open(JSON_LOG_FILE, "r", encoding="utf-8") as f:
+            try:
+                logs = json.load(f)
+            except json.JSONDecodeError:
+                logs = []
 
-    conn.commit()
-    conn.close()
+        next_id = 1
+
+        if len(logs) > 0:
+            next_id = logs[-1].get("id", 0) + 1
+
+        log_item = {
+            "id": next_id,
+            "timestamp": timestamp,
+            "user_email": user_email,
+            "user_name": user_name,
+            "action": action,
+            "angle": angle,
+            "duration": duration,
+            "mqtt_topic": MQTT_TOPIC,
+            "result": result,
+            "ip_address": ip_address
+        }
+
+        logs.append(log_item)
+
+        with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                logs,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    return log_item
 
 
 # ===== MQTT接続成功時 =====
@@ -130,7 +138,6 @@ def init_mqtt():
     print("MQTT接続中...")
     MQTT_CLIENT.connect(MQTT_BROKER, MQTT_PORT, 60)
 
-    # バックグラウンドでMQTT通信維持
     MQTT_CLIENT.loop_start()
 
     print("MQTT client started")
@@ -170,7 +177,6 @@ def publish_mqtt(angle, duration):
     if MQTT_CLIENT is None:
         raise RuntimeError("MQTTクライアントが初期化されていません")
 
-    # 複数リクエストが同時に来たときの競合防止
     with MQTT_LOCK:
         if not MQTT_CLIENT.is_connected():
             print("MQTTが切断されています。再接続します。")
@@ -191,7 +197,12 @@ def publish_mqtt(angle, duration):
 # ===== トップページ =====
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        supabase_url=SUPABASE_URL,
+        supabase_anon_key=SUPABASE_ANON_KEY,
+        app_url=APP_URL
+    )
 
 
 # ===== サーボ操作API =====
@@ -199,7 +210,9 @@ def index():
 def servo():
     data = request.get_json(silent=True) or {}
 
-    # HTML側から送られてくるGoogleログイン情報
+    print("===== 受信データ =====")
+    print(data)
+
     user_email = data.get("email", "unknown-user")
     user_name = data.get("name", "unknown-name")
 
@@ -214,7 +227,6 @@ def servo():
             "message": "angle または duration が数値ではありません"
         }), 400
 
-    # 安全制限
     angle = max(0, min(angle, 180))
     duration = max(0, min(duration, 5000))
 
@@ -223,7 +235,7 @@ def servo():
     try:
         mqtt_message = publish_mqtt(angle, duration)
 
-        save_log(
+        log_item = save_log(
             user_email=user_email,
             user_name=user_name,
             action=action,
@@ -239,11 +251,12 @@ def servo():
             "user_name": user_name,
             "action": action,
             "mqtt_topic": MQTT_TOPIC,
-            "mqtt_message": mqtt_message
+            "mqtt_message": mqtt_message,
+            "log": log_item
         })
 
     except Exception as e:
-        save_log(
+        log_item = save_log(
             user_email=user_email,
             user_name=user_name,
             action=action,
@@ -255,38 +268,54 @@ def servo():
 
         return jsonify({
             "status": "error",
-            "message": str(e)
+            "message": str(e),
+            "log": log_item
         }), 500
 
 
-# ===== ログ取得 =====
+# ===== ログ取得API =====
 @app.route("/logs")
 def logs():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    logs = load_json_logs()
 
-    cur.execute("""
-        SELECT
-            id,
-            timestamp,
-            user_email,
-            user_name,
-            action,
-            angle,
-            duration,
-            mqtt_topic,
-            result,
-            ip_address
-        FROM access_logs
-        ORDER BY id DESC
-        LIMIT 50
-    """)
+    latest_logs = list(reversed(logs))[:50]
 
-    rows = cur.fetchall()
-    conn.close()
+    return jsonify(latest_logs)
 
-    return jsonify([dict(row) for row in rows])
+
+# ===== JSONログファイル全体取得 =====
+@app.route("/logs/file")
+def logs_file():
+    logs = load_json_logs()
+
+    return jsonify(logs)
+
+
+# ===== ログ削除API =====
+@app.route("/logs/clear", methods=["POST"])
+def clear_logs():
+    with JSON_LOG_LOCK:
+        with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+
+    return jsonify({
+        "status": "ok",
+        "message": "ログを削除しました"
+    })
+
+
+# ===== 設定確認用API =====
+@app.route("/config-check")
+def config_check():
+    return jsonify({
+        "supabase_url_set": bool(SUPABASE_URL),
+        "supabase_anon_key_set": bool(SUPABASE_ANON_KEY),
+        "app_url": APP_URL,
+        "mqtt_broker": MQTT_BROKER,
+        "mqtt_port": MQTT_PORT,
+        "mqtt_topic": MQTT_TOPIC,
+        "json_log_file": JSON_LOG_FILE
+    })
 
 
 # ===== 動作確認用 =====
@@ -302,14 +331,21 @@ def health():
         "mqtt_connected": mqtt_status,
         "mqtt_broker": MQTT_BROKER,
         "mqtt_port": MQTT_PORT,
-        "mqtt_topic": MQTT_TOPIC
+        "mqtt_topic": MQTT_TOPIC,
+        "json_log_file": JSON_LOG_FILE
     })
 
 
 if __name__ == "__main__":
-    init_db()
+    if not SUPABASE_URL:
+        print("警告: .env に SUPABASE_URL が設定されていません")
+
+    if not SUPABASE_ANON_KEY:
+        print("警告: .env に SUPABASE_ANON_KEY が設定されていません")
+
+    print("APP_URL:", APP_URL)
+
+    init_json_log()
     init_mqtt()
 
-    # debug=True だと自動リロードでMQTTクライアントが二重起動することがあるため、
-    # 今回は debug=False 推奨
     app.run(host="0.0.0.0", port=5000, debug=False)

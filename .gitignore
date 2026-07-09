@@ -1,2 +1,38 @@
 .pio
 env.h
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs / DB
+logs.db
+access_logs.json
+*.log
+
+# Environment
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# Logs / DB
+access_logs.json
+logs.db
+*.log
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db

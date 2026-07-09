@@ -140,17 +140,26 @@ input{
 // =========================
 
 const SUPABASE_URL =
-"https://mqfrepagtgucjsausxao.supabase.co";
+"{{ supabase_url }}";
 
 const SUPABASE_KEY =
-"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1xZnJlcGFndGd1Y2pzYXVzeGFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1MTczNTAsImV4cCI6MjA5OTA5MzM1MH0.5VDODBSlPLSFGfC20cNpILbbtoKzspbokkAbI5f4pQw";
+"{{ supabase_anon_key }}";
+
+const APP_URL =
+"{{ app_url }}";
 
 const supabaseClient =
 window.supabase.createClient(
     SUPABASE_URL,
-    SUPABASE_KEY
+    SUPABASE_KEY,
+    {
+        auth: {
+            detectSessionInUrl: true,
+            persistSession: true,
+            autoRefreshToken: true
+        }
+    }
 );
-
 
 // =========================
 // Googleログイン
@@ -165,7 +174,7 @@ async function googleLogin() {
         await supabaseClient.auth.signInWithOAuth({
             provider: "google",
             options: {
-                redirectTo: window.location.origin
+                redirectTo: APP_URL
             }
         });
 
