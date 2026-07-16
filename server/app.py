@@ -25,9 +25,26 @@ APP_URL = os.getenv("APP_URL", "http://localhost:5000")
 MQTT_BROKER = os.getenv("MQTT_BROKER", "broker.hivemq.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8884"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "m5stack/device_02/servo")
+MQTT_STATUS_TOPIC = os.getenv("MQTT_STATUS_TOPIC", "m5stack/device_02/status")
 
 MQTT_CLIENT = None
 MQTT_LOCK = threading.Lock()
+
+# ===== 鍵状態 (main.cppのcheckLockStateが "2,<code>" 形式で送信) =====
+LOCK_STATE_LABELS = {
+    "1": "UNLOCK",
+    "2": "LOCK",
+    "3": "MIDDLE",
+    "4": "ERROR"
+}
+
+STATUS_LOCK = threading.Lock()
+latest_status = {
+    "code": None,
+    "label": "unknown",
+    "raw": None,
+    "updated_at": None
+}
 
 
 # ===== JSONログ設定 =====
@@ -112,11 +129,36 @@ def save_log(
 # ===== MQTT接続成功時 =====
 def on_connect(client, userdata, flags, reason_code, properties):
     print("MQTT接続結果:", reason_code)
+    client.subscribe(MQTT_STATUS_TOPIC)
 
 
 # ===== MQTT送信完了時 =====
 def on_publish(client, userdata, mid, reason_code, properties):
     print("MQTT送信完了 mid:", mid, "reason_code:", reason_code)
+
+
+# ===== MQTT状態受信時 =====
+def on_message(client, userdata, msg):
+    global latest_status
+
+    payload = msg.payload.decode("utf-8", errors="replace")
+
+    print("===== MQTT状態受信 =====")
+    print("TOPIC:", msg.topic)
+    print("PAYLOAD:", payload)
+
+    code = payload.split(",")[-1].strip()
+    label = LOCK_STATE_LABELS.get(code, "unknown")
+
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+
+    with STATUS_LOCK:
+        latest_status = {
+            "code": code,
+            "label": label,
+            "raw": payload,
+            "updated_at": datetime.datetime.now(jst).isoformat(timespec="seconds")
+        }
 
 
 # ===== MQTT初期化 =====
@@ -130,6 +172,7 @@ def init_mqtt():
 
     MQTT_CLIENT.on_connect = on_connect
     MQTT_CLIENT.on_publish = on_publish
+    MQTT_CLIENT.on_message = on_message
 
     # wss://broker.hivemq.com:8884/mqtt 相当
     MQTT_CLIENT.tls_set()
@@ -273,6 +316,13 @@ def servo():
         }), 500
 
 
+# ===== 鍵状態取得API =====
+@app.route("/api/status")
+def api_status():
+    with STATUS_LOCK:
+        return jsonify(dict(latest_status))
+
+
 # ===== ログ取得API =====
 @app.route("/logs")
 def logs():
@@ -314,6 +364,7 @@ def config_check():
         "mqtt_broker": MQTT_BROKER,
         "mqtt_port": MQTT_PORT,
         "mqtt_topic": MQTT_TOPIC,
+        "mqtt_status_topic": MQTT_STATUS_TOPIC,
         "json_log_file": JSON_LOG_FILE
     })
 

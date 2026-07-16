@@ -114,6 +114,12 @@ input{
         接続確認中...
     </p>
 
+    <h2>鍵の状態</h2>
+
+    <div id="lockStatus" class="log">
+        状態取得中...
+    </div>
+
     <h2>結果</h2>
 
     <div id="result" class="log">
@@ -259,6 +265,11 @@ function showLoginArea() {
 
     document.getElementById("loginStatus").innerText =
         "Googleアカウントでログインしてください。";
+
+    if(lockStatusTimer){
+        clearInterval(lockStatusTimer);
+        lockStatusTimer = null;
+    }
 }
 
 
@@ -284,6 +295,63 @@ function showControlArea(user) {
         "Google認証済み。操作できます。";
 
     loadLogs();
+    loadLockStatus();
+    startLockStatusPolling();
+}
+
+
+// =========================
+// 鍵状態表示
+// =========================
+
+const LOCK_STATE_TEXT = {
+    "UNLOCK": "開錠 (UNLOCK)",
+    "LOCK": "施錠 (LOCK)",
+    "MIDDLE": "中間 (MIDDLE)",
+    "ERROR": "異常 (ERROR)",
+    "unknown": "不明 (状態未受信)"
+};
+
+let lockStatusTimer = null;
+
+async function loadLockStatus(){
+
+    try{
+
+        const response =
+            await fetch("/api/status");
+
+        const status =
+            await response.json();
+
+        const label =
+            LOCK_STATE_TEXT[status.label] ||
+            status.label ||
+            "不明";
+
+        const updatedAt =
+            status.updated_at || "未受信";
+
+        document.getElementById("lockStatus").innerText =
+            `状態: ${label}\n最終更新: ${updatedAt}`;
+
+    }catch(error){
+
+        document.getElementById("lockStatus").innerText =
+            error.toString();
+
+    }
+}
+
+
+function startLockStatusPolling(){
+
+    if(lockStatusTimer){
+        return;
+    }
+
+    lockStatusTimer =
+        setInterval(loadLockStatus, 3000);
 }
 
 
