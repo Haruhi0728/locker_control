@@ -32,6 +32,34 @@ input{
     white-space:pre-wrap;
 }
 
+.logTableWrap{
+    margin-top:20px;
+    overflow-x:auto;
+}
+
+table.logTable{
+    width:100%;
+    border-collapse:collapse;
+    font-size:14px;
+    background:#fff;
+}
+
+table.logTable th,
+table.logTable td{
+    border:1px solid #ccc;
+    padding:6px 10px;
+    text-align:left;
+    white-space:nowrap;
+}
+
+table.logTable th{
+    background:#e8f4ff;
+}
+
+table.logTable tbody tr:nth-child(even){
+    background:#f7f7f7;
+}
+
 .userbox{
     padding:15px;
     margin-bottom:20px;
@@ -126,14 +154,31 @@ input{
         まだ操作していません
     </div>
 
-    <h2>最近のログ</h2>
+    <h2>最近のログ（最新50件・全履歴はDBに永久保存）</h2>
 
     <button onclick="loadLogs()">
         ログ更新
     </button>
 
-    <div id="logs" class="log">
-        ログ未取得
+    <div class="logTableWrap">
+        <table class="logTable">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>日時</th>
+                    <th>ユーザー</th>
+                    <th>メール</th>
+                    <th>操作</th>
+                    <th>角度</th>
+                    <th>時間(ms)</th>
+                    <th>結果</th>
+                    <th>IPアドレス</th>
+                </tr>
+            </thead>
+            <tbody id="logsTableBody">
+                <tr><td colspan="9">ログ未取得</td></tr>
+            </tbody>
+        </table>
     </div>
 
 </div>
@@ -232,6 +277,26 @@ async function getCurrentUser() {
 
 
 // =========================
+// 認証ヘッダー取得
+// =========================
+
+async function getAuthHeaders() {
+
+    const {
+        data: { session }
+    } = await supabaseClient.auth.getSession();
+
+    if(!session){
+        return {};
+    }
+
+    return {
+        "Authorization": `Bearer ${session.access_token}`
+    };
+}
+
+
+// =========================
 // 画面切り替え
 // =========================
 
@@ -277,7 +342,7 @@ function showLoginArea() {
 // コントロール画面表示
 // =========================
 
-function showControlArea(user) {
+async function showControlArea(user) {
 
     document.getElementById("loginArea").style.display =
         "none";
@@ -292,11 +357,58 @@ function showControlArea(user) {
         `ログイン中 : ${name} (${user.email})`;
 
     document.getElementById("status").innerText =
+        "権限を確認中...";
+
+    const allowed = await verifyAccess();
+
+    if(!allowed){
+        return;
+    }
+
+    document.getElementById("status").innerText =
         "Google認証済み。操作できます。";
 
     loadLogs();
     loadLockStatus();
     startLockStatusPolling();
+}
+
+
+// =========================
+// 操作権限の確認
+// =========================
+
+async function verifyAccess() {
+
+    try{
+
+        const response =
+            await fetch("/api/whoami", {
+                headers: await getAuthHeaders()
+            });
+
+        if(response.ok){
+            return true;
+        }
+
+        const result =
+            await response.json();
+
+        alert(
+            result.message ||
+            "このアカウントには操作権限がありません。"
+        );
+
+    }catch(error){
+
+        alert(
+            "権限確認中にエラーが発生しました: " +
+            error.toString()
+        );
+    }
+
+    await logout();
+    return false;
 }
 
 
@@ -319,7 +431,9 @@ async function loadLockStatus(){
     try{
 
         const response =
-            await fetch("/api/status");
+            await fetch("/api/status", {
+                headers: await getAuthHeaders()
+            });
 
         const status =
             await response.json();
@@ -376,22 +490,18 @@ async function sendServoCommand(
         return;
     }
 
-    const userName =
-        user.user_metadata.name || "unknown-name";
-
     const response = await fetch(
         "/api/servo",
         {
             method:"POST",
             headers:{
-                "Content-Type":"application/json"
+                "Content-Type":"application/json",
+                ...(await getAuthHeaders())
             },
             body:JSON.stringify({
                 action:action,
                 angle:angle,
-                duration:duration,
-                email:user.email,
-                name:userName
+                duration:duration
             })
         }
     );
@@ -459,30 +569,69 @@ function openServo(){
 
 
 // =========================
+// HTMLエスケープ
+// =========================
+
+function escapeHtml(value){
+
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+
+// =========================
 // ログ取得
 // =========================
 
 async function loadLogs(){
 
+    const tbody =
+        document.getElementById("logsTableBody");
+
     try{
 
         const response =
-            await fetch("/logs");
+            await fetch("/logs", {
+                headers: await getAuthHeaders()
+            });
 
         const logs =
             await response.json();
 
-        document.getElementById("logs").innerText =
-            JSON.stringify(
-                logs,
-                null,
-                2
-            );
+        if(!Array.isArray(logs) || logs.length === 0){
+
+            tbody.innerHTML =
+                '<tr><td colspan="9">ログがありません</td></tr>';
+
+            return;
+        }
+
+        tbody.innerHTML = logs.map(function(log){
+
+            return `
+                <tr>
+                    <td>${escapeHtml(log.id)}</td>
+                    <td>${escapeHtml(log.timestamp)}</td>
+                    <td>${escapeHtml(log.user_name)}</td>
+                    <td>${escapeHtml(log.user_email)}</td>
+                    <td>${escapeHtml(log.action)}</td>
+                    <td>${escapeHtml(log.angle)}</td>
+                    <td>${escapeHtml(log.duration)}</td>
+                    <td>${escapeHtml(log.result)}</td>
+                    <td>${escapeHtml(log.ip_address)}</td>
+                </tr>
+            `;
+
+        }).join("");
 
     }catch(error){
 
-        document.getElementById("logs").innerText =
-            error.toString();
+        tbody.innerHTML =
+            `<tr><td colspan="9">${escapeHtml(error.toString())}</td></tr>`;
 
     }
 }

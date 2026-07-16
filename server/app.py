@@ -4,6 +4,9 @@ import json
 import threading
 import atexit
 import os
+import sqlite3
+import urllib.request
+import urllib.error
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 
@@ -19,6 +22,22 @@ app = Flask(__name__)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 APP_URL = os.getenv("APP_URL", "http://localhost:5000")
+
+
+# ===== アクセス許可アカウント設定 =====
+ALLOWED_EMAILS = set(
+    email.strip().lower()
+    for email in os.getenv("ALLOWED_EMAILS", "").split(",")
+    if email.strip()
+)
+
+
+# ===== 未許可ログイン通知設定 (Discord Webhook) =====
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+NOTIFY_COOLDOWN_SECONDS = 300
+
+_last_notified_at = {}
+_notify_lock = threading.Lock()
 
 
 # ===== MQTT設定 =====
@@ -47,33 +66,85 @@ latest_status = {
 }
 
 
-# ===== JSONログ設定 =====
-JSON_LOG_FILE = os.getenv("JSON_LOG_FILE", "access_logs.json")
-JSON_LOG_LOCK = threading.Lock()
+# ===== ログDB設定 (SQLite / 永久保存) =====
+LOG_DB_FILE = os.getenv("LOG_DB_FILE", "logs.db")
+LEGACY_JSON_LOG_FILE = os.getenv("JSON_LOG_FILE", "access_logs.json")
+LOG_DB_LOCK = threading.Lock()
 
 
-# ===== JSONログ初期化 =====
-def init_json_log():
-    if not os.path.exists(JSON_LOG_FILE):
-        with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
+# ===== ログDB初期化 =====
+def init_log_db():
+    with LOG_DB_LOCK:
+        conn = sqlite3.connect(LOG_DB_FILE)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS access_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    user_email TEXT,
+                    user_name TEXT,
+                    action TEXT NOT NULL,
+                    angle INTEGER,
+                    duration INTEGER,
+                    mqtt_topic TEXT,
+                    result TEXT,
+                    ip_address TEXT
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    migrate_legacy_json_logs()
 
 
-# ===== JSONログ読み込み =====
-def load_json_logs():
-    init_json_log()
+# ===== 旧JSONログをDBへ取り込み (初回起動時のみ) =====
+def migrate_legacy_json_logs():
+    if not os.path.exists(LEGACY_JSON_LOG_FILE):
+        return
 
-    with JSON_LOG_LOCK:
-        with open(JSON_LOG_FILE, "r", encoding="utf-8") as f:
+    with open(LEGACY_JSON_LOG_FILE, "r", encoding="utf-8") as f:
+        try:
+            legacy_logs = json.load(f)
+        except json.JSONDecodeError:
+            legacy_logs = []
+
+    if legacy_logs:
+        with LOG_DB_LOCK:
+            conn = sqlite3.connect(LOG_DB_FILE)
             try:
-                logs = json.load(f)
-            except json.JSONDecodeError:
-                logs = []
+                conn.executemany(
+                    """
+                    INSERT INTO access_logs
+                        (timestamp, user_email, user_name, action, angle,
+                         duration, mqtt_topic, result, ip_address)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            log.get("timestamp"),
+                            log.get("user_email"),
+                            log.get("user_name"),
+                            log.get("action"),
+                            log.get("angle"),
+                            log.get("duration"),
+                            log.get("mqtt_topic"),
+                            log.get("result"),
+                            log.get("ip_address")
+                        )
+                        for log in legacy_logs
+                    ]
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-    return logs
+        print(f"旧JSONログ {len(legacy_logs)}件をDBへ移行しました")
+
+    os.remove(LEGACY_JSON_LOG_FILE)
 
 
-# ===== JSONログ保存 =====
+# ===== ログ保存 (SQLite) =====
 def save_log(
     user_email,
     user_name,
@@ -83,47 +154,65 @@ def save_log(
     result,
     ip_address
 ):
-    init_json_log()
-
     jst = datetime.timezone(datetime.timedelta(hours=9))
     timestamp = datetime.datetime.now(jst).isoformat(timespec="seconds")
 
-    with JSON_LOG_LOCK:
-        with open(JSON_LOG_FILE, "r", encoding="utf-8") as f:
-            try:
-                logs = json.load(f)
-            except json.JSONDecodeError:
-                logs = []
-
-        next_id = 1
-
-        if len(logs) > 0:
-            next_id = logs[-1].get("id", 0) + 1
-
-        log_item = {
-            "id": next_id,
-            "timestamp": timestamp,
-            "user_email": user_email,
-            "user_name": user_name,
-            "action": action,
-            "angle": angle,
-            "duration": duration,
-            "mqtt_topic": MQTT_TOPIC,
-            "result": result,
-            "ip_address": ip_address
-        }
-
-        logs.append(log_item)
-
-        with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                logs,
-                f,
-                ensure_ascii=False,
-                indent=2
+    with LOG_DB_LOCK:
+        conn = sqlite3.connect(LOG_DB_FILE)
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO access_logs
+                    (timestamp, user_email, user_name, action, angle,
+                     duration, mqtt_topic, result, ip_address)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp, user_email, user_name, action, angle,
+                    duration, MQTT_TOPIC, result, ip_address
+                )
             )
+            conn.commit()
+            log_id = cur.lastrowid
+        finally:
+            conn.close()
 
-    return log_item
+    return {
+        "id": log_id,
+        "timestamp": timestamp,
+        "user_email": user_email,
+        "user_name": user_name,
+        "action": action,
+        "angle": angle,
+        "duration": duration,
+        "mqtt_topic": MQTT_TOPIC,
+        "result": result,
+        "ip_address": ip_address
+    }
+
+
+# ===== ログ読み込み (SQLite) =====
+def load_logs(limit=None):
+    query = (
+        "SELECT id, timestamp, user_email, user_name, action, angle, "
+        "duration, mqtt_topic, result, ip_address "
+        "FROM access_logs ORDER BY id DESC"
+    )
+
+    params = ()
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params = (limit,)
+
+    conn = sqlite3.connect(LOG_DB_FILE)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    return [dict(row) for row in rows]
 
 
 # ===== MQTT接続成功時 =====
@@ -237,6 +326,111 @@ def publish_mqtt(angle, duration):
     return msg
 
 
+# ===== Supabaseトークン検証 =====
+def verify_supabase_user(access_token):
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        return None
+
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "apikey": SUPABASE_ANON_KEY
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return json.loads(res.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError):
+        return None
+
+
+# ===== Discord通知送信 =====
+def send_discord_notification(message):
+    if not DISCORD_WEBHOOK_URL:
+        print("警告: DISCORD_WEBHOOK_URL が未設定のため通知を送信できません")
+        return
+
+    payload = json.dumps({"content": message}).encode("utf-8")
+
+    req = urllib.request.Request(
+        DISCORD_WEBHOOK_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (locker_control notifier)"
+        },
+        method="POST"
+    )
+
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        print("Discord通知送信エラー:", e)
+
+
+# ===== 未許可ログインの通知 (同一アカウントは一定時間クールダウン) =====
+def notify_unauthorized_login(user, ip_address):
+    email = user.get("email", "unknown")
+
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+    with _notify_lock:
+        last = _last_notified_at.get(email, 0)
+
+        if now - last < NOTIFY_COOLDOWN_SECONDS:
+            return
+
+        _last_notified_at[email] = now
+
+    name = (user.get("user_metadata") or {}).get("name", "unknown")
+
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    timestamp = datetime.datetime.now(jst).isoformat(timespec="seconds")
+
+    message = (
+        "許可されていないGoogleアカウントがログインを試みました\n"
+        f"メール: {email}\n"
+        f"名前: {name}\n"
+        f"IP: {ip_address}\n"
+        f"日時: {timestamp}"
+    )
+
+    threading.Thread(
+        target=send_discord_notification,
+        args=(message,),
+        daemon=True
+    ).start()
+
+
+# ===== 許可アカウントチェック =====
+# 戻り値: (user情報, None) が成功時 / (None, (HTTPステータス, メッセージ)) が失敗時
+# notify_on_deny=True の場合、未許可アカウントの検出時にDiscordへ通知する
+def require_allowed_user(notify_on_deny=False):
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        return None, (401, "ログインしてください。")
+
+    access_token = auth_header[len("Bearer "):]
+
+    user = verify_supabase_user(access_token)
+
+    if user is None:
+        return None, (401, "認証に失敗しました。再度ログインしてください。")
+
+    email = (user.get("email") or "").strip().lower()
+
+    if not email or email not in ALLOWED_EMAILS:
+        if notify_on_deny:
+            notify_unauthorized_login(user, request.remote_addr)
+
+        return None, (403, "このGoogleアカウントには操作権限がありません。管理者に連絡してください。")
+
+    return user, None
+
+
 # ===== トップページ =====
 @app.route("/")
 def index():
@@ -251,13 +445,19 @@ def index():
 # ===== サーボ操作API =====
 @app.route("/api/servo", methods=["POST"])
 def servo():
+    user, err = require_allowed_user()
+
+    if err:
+        status_code, message = err
+        return jsonify({"status": "error", "message": message}), status_code
+
     data = request.get_json(silent=True) or {}
 
     print("===== 受信データ =====")
     print(data)
 
-    user_email = data.get("email", "unknown-user")
-    user_name = data.get("name", "unknown-name")
+    user_email = user.get("email", "unknown-user")
+    user_name = (user.get("user_metadata") or {}).get("name", user_email)
 
     action = str(data.get("action", "CUSTOM")).upper()
 
@@ -316,9 +516,31 @@ def servo():
         }), 500
 
 
+# ===== 認証確認用API =====
+@app.route("/api/whoami")
+def whoami():
+    user, err = require_allowed_user(notify_on_deny=True)
+
+    if err:
+        status_code, message = err
+        return jsonify({"status": "error", "message": message}), status_code
+
+    return jsonify({
+        "status": "ok",
+        "email": user.get("email"),
+        "name": (user.get("user_metadata") or {}).get("name")
+    })
+
+
 # ===== 鍵状態取得API =====
 @app.route("/api/status")
 def api_status():
+    user, err = require_allowed_user()
+
+    if err:
+        status_code, message = err
+        return jsonify({"status": "error", "message": message}), status_code
+
     with STATUS_LOCK:
         return jsonify(dict(latest_status))
 
@@ -326,27 +548,43 @@ def api_status():
 # ===== ログ取得API =====
 @app.route("/logs")
 def logs():
-    logs = load_json_logs()
+    user, err = require_allowed_user()
 
-    latest_logs = list(reversed(logs))[:50]
+    if err:
+        status_code, message = err
+        return jsonify({"status": "error", "message": message}), status_code
 
-    return jsonify(latest_logs)
+    return jsonify(load_logs(limit=50))
 
 
-# ===== JSONログファイル全体取得 =====
+# ===== ログ全件取得 (DB全履歴) =====
 @app.route("/logs/file")
 def logs_file():
-    logs = load_json_logs()
+    user, err = require_allowed_user()
 
-    return jsonify(logs)
+    if err:
+        status_code, message = err
+        return jsonify({"status": "error", "message": message}), status_code
+
+    return jsonify(load_logs())
 
 
 # ===== ログ削除API =====
 @app.route("/logs/clear", methods=["POST"])
 def clear_logs():
-    with JSON_LOG_LOCK:
-        with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
+    user, err = require_allowed_user()
+
+    if err:
+        status_code, message = err
+        return jsonify({"status": "error", "message": message}), status_code
+
+    with LOG_DB_LOCK:
+        conn = sqlite3.connect(LOG_DB_FILE)
+        try:
+            conn.execute("DELETE FROM access_logs")
+            conn.commit()
+        finally:
+            conn.close()
 
     return jsonify({
         "status": "ok",
@@ -365,7 +603,9 @@ def config_check():
         "mqtt_port": MQTT_PORT,
         "mqtt_topic": MQTT_TOPIC,
         "mqtt_status_topic": MQTT_STATUS_TOPIC,
-        "json_log_file": JSON_LOG_FILE
+        "log_db_file": LOG_DB_FILE,
+        "allowed_emails_count": len(ALLOWED_EMAILS),
+        "discord_webhook_set": bool(DISCORD_WEBHOOK_URL)
     })
 
 
@@ -383,7 +623,7 @@ def health():
         "mqtt_broker": MQTT_BROKER,
         "mqtt_port": MQTT_PORT,
         "mqtt_topic": MQTT_TOPIC,
-        "json_log_file": JSON_LOG_FILE
+        "log_db_file": LOG_DB_FILE
     })
 
 
@@ -394,9 +634,15 @@ if __name__ == "__main__":
     if not SUPABASE_ANON_KEY:
         print("警告: .env に SUPABASE_ANON_KEY が設定されていません")
 
+    if not ALLOWED_EMAILS:
+        print("警告: .env に ALLOWED_EMAILS が設定されていません（全アカウントの操作が拒否されます）")
+
+    if not DISCORD_WEBHOOK_URL:
+        print("警告: .env に DISCORD_WEBHOOK_URL が設定されていません（未許可ログインの通知は送信されません）")
+
     print("APP_URL:", APP_URL)
 
-    init_json_log()
+    init_log_db()
     init_mqtt()
 
     app.run(host="0.0.0.0", port=5000, debug=False)
